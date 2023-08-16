@@ -174,6 +174,7 @@ export class WebrtcConn {
     log('establishing connection to ', logging.BOLD, remotePeerId)
     this.room = room
     this.remotePeerId = remotePeerId
+    this.glareToken = undefined
     this.closed = false
     this.connected = false
     this.synced = false
@@ -182,7 +183,11 @@ export class WebrtcConn {
      */
     this.peer = new Peer({ initiator, ...room.provider.peerOpts })
     this.peer.on('signal', signal => {
-      publishSignalingMessage(signalingConn, room, { to: remotePeerId, from: room.peerId, type: 'signal', signal })
+      if (this.glareToken === undefined) {
+        // add some randomness to the timestamp of the offer
+        this.glareToken = Date.now() + Math.random()
+      }
+      publishSignalingMessage(signalingConn, room, { to: remotePeerId, from: room.peerId, type: 'signal', token: this.glareToken, signal })
     })
     this.peer.on('connect', () => {
       log('connected to ', logging.BOLD, remotePeerId)
@@ -263,7 +268,7 @@ const broadcastRoomMessage = (room, m) => {
  */
 const announceSignalingInfo = room => {
   signalingConns.forEach(conn => {
-    // only subcribe if connection is established, otherwise the conn automatically subscribes to all rooms
+    // only subscribe if connection is established, otherwise the conn automatically subscribes to all rooms
     if (conn.connected) {
       conn.send({ type: 'subscribe', topics: [room.name] })
       if (room.webrtcConns.size < room.provider.maxConns) {
@@ -515,6 +520,24 @@ export class SignalingConn extends ws.WebsocketClient {
                 }
                 break
               case 'signal':
+                if (data.signal.type === 'offer') {
+                  const existingConn = webrtcConns.get(data.from)
+                  if (existingConn) {
+                    const remoteToken = data.token
+                    const localToken = existingConn.glareToken
+                    if (localToken && localToken > remoteToken) {
+                      log('offer rejected: ', data.from)
+                      return
+                    }
+                    // if we don't reject the offer, we will be accepting it and answering it
+                    existingConn.glareToken = undefined
+                  }
+                }
+                if (data.signal.type === 'answer') {
+                  log('offer answered by: ', data.from)
+                  const existingConn = webrtcConns.get(data.from)
+                  existingConn.glareToken = undefined
+                }
                 if (data.to === peerId) {
                   map.setIfUndefined(webrtcConns, data.from, () => new WebrtcConn(this, false, data.from, room)).peer.signal(data.signal)
                   emitPeerChange()
@@ -537,25 +560,29 @@ export class SignalingConn extends ws.WebsocketClient {
 }
 
 /**
+ * @typedef {Object} ProviderOptions
+ * @property {Array<string>} [signaling]
+ * @property {string} [password]
+ * @property {awarenessProtocol.Awareness} [awareness]
+ * @property {number} [maxConns]
+ * @property {boolean} [filterBcConns]
+ * @property {any} [peerOpts]
+ */
+
+/**
  * @extends Observable<string>
  */
 export class WebrtcProvider extends Observable {
   /**
    * @param {string} roomName
    * @param {Y.Doc} doc
-   * @param {Object} [opts]
-   * @param {Array<string>?} [opts.signaling]
-   * @param {string?} [opts.password]
-   * @param {awarenessProtocol.Awareness?} [opts.awareness]
-   * @param {number?} [opts.maxConns]
-   * @param {boolean?} [opts.filterBcConns]
-   * @param {any?} [opts.peerOpts]
+   * @param {ProviderOptions?} opts
    */
   constructor (
     roomName,
     doc,
     {
-      signaling = ['wss://signaling.yjs.dev', 'wss://y-webrtc-signaling-eu.herokuapp.com', 'wss://y-webrtc-signaling-us.herokuapp.com'],
+      signaling = ['wss://y-webrtc-eu.fly.dev'],
       password = null,
       awareness = new awarenessProtocol.Awareness(doc),
       maxConns = 20 + math.floor(random.rand() * 15), // the random factor reduces the chance that n clients form a cluster
